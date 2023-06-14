@@ -54,10 +54,10 @@ function log_message(string $message, array $context = [])
 }
 
 // Sending email
-function send(int $interval, PDO $db) {
+function send(int $interval, PDO $db, int $startUserId, int $limitUserId) {
 
     // Cursor initialization
-    $lastId = 0;
+    $lastId = $startUserId;
 
     while (true) {
         // Getting subscriptions that expire in 1 or 3 days
@@ -66,13 +66,16 @@ function send(int $interval, PDO $db) {
             FROM subscriptions
             LEFT JOIN users ON users.id = subscriptions.user_id
             WHERE subscriptions.id > :lastId
+              AND subscriptions.id <= :limitId
               AND date(subscriptions.expired_at) = (CURDATE() +  INTERVAL :interval DAY)            
               AND (is_valid = true OR is_checked = false)
             ORDER BY id ASC
             LIMIT 1000
         ");
+
         $query->bindParam(':lastId', $lastId, PDO::PARAM_INT);
         $query->bindParam(':interval', $interval, PDO::PARAM_INT);
+        $query->bindParam(':limitId', $limitUserId, PDO::PARAM_INT);
         $query->execute();
         $subscriptions = $query->fetchAll(PDO::FETCH_ASSOC);
 
@@ -113,3 +116,56 @@ function send(int $interval, PDO $db) {
     }
 }
 
+/**
+ * @param PDO $db
+ * @param int $countParts
+ * @param int $interval
+ * @return int
+ */
+function run_senders(PDO $db, int $countParts, int $interval): int
+{
+    // Initialize the increment variable in the database
+    $db->prepare('SET @increment=0')->execute();
+
+    $query = $db->prepare("
+        select tmp.user_id from (
+            SELECT  subscriptions.user_id, (@increment:=@increment+1) AS increment
+            FROM subscriptions
+            LEFT JOIN users ON users.id = subscriptions.user_id
+            WHERE date(subscriptions.expired_at) = (CURDATE() +  INTERVAL :interval DAY)            
+              AND (is_valid = true OR is_checked = false)
+            ORDER BY subscriptions.user_id ASC
+            ) as tmp
+        WHERE MOD(tmp.increment, :countParts) = 0;
+    ");
+
+    $query->bindParam(':interval', $interval, PDO::PARAM_INT);
+    $query->bindParam(':countParts', $countParts, PDO::PARAM_INT);
+    $query->execute();
+
+    $idsResponse = $query->fetchAll(PDO::FETCH_ASSOC);
+
+    // Initialize an array to hold the divided parts
+    $parts = [];
+
+    // If there are returned rows, divide them into parts
+    if ($idsResponse) {
+        // The first part starts from 0 to the first user_id
+        $parts[] = ['start_user_id' => 0, 'limit_user_id' => $idsResponse[0]['user_id']];
+
+        // For each pair of user_ids, create a new part starting from the first user_id and ending with the second
+        for ($i = 0; $i < count($idsResponse) - 1; $i++) {
+            $parts[] = ['start_user_id' => $idsResponse[$i]['user_id'], 'limit_user_id' => $idsResponse[$i + 1]['user_id']];
+        }
+
+        // The last part starts from the last user_id and goes to the maximum integer
+        $parts[] = ['start_user_id' => $idsResponse[$i]['user_id'], 'limit_user_id' => PHP_INT_MAX];
+
+        // For each part, run the email-sender.php script with the part's bounds as arguments
+        foreach ($parts as $part) {
+            $command = sprintf('php email-sender.php %d %d %d > /dev/null &', $interval, $part['start_user_id'], $part['limit_user_id']);
+            log_message('Run command', ['command' => $command]);
+            exec($command);
+        }
+    }
+}
